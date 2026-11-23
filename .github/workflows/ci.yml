@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Cancela execuções antigas do mesmo ref quando um novo push chega.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: typecheck + lint + test + build
+    runs-on: ubuntu-latest
+
+    # Mesmo motor do dev local (docker-compose.yml): Postgres 17 + pgvector.
+    services:
+      db:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: contentcreate
+          POSTGRES_PASSWORD: contentcreate
+          POSTGRES_DB: contentcreate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U contentcreate -d contentcreate"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Credenciais descartáveis do container de CI — nenhum segredo real.
+      DATABASE_URL: postgresql://contentcreate:contentcreate@localhost:5432/contentcreate?schema=public
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instala dependências
+        run: npm ci
+
+      - name: Gera o client Prisma
+        run: npm run prisma:generate
+
+      - name: Aplica migrations
+        run: npx prisma migrate deploy
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Testes
+        run: npm run test:run
+
+      - name: Build
+        run: npm run build

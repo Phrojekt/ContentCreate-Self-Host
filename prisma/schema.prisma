@@ -1,0 +1,198 @@
+// Fonte de verdade do modelo de dados do ContentCreate.
+//
+// Prisma 7: a URL de conexão NÃO vive mais aqui — vive em `prisma.config.ts`
+// (datasource) e o client roda sobre um driver adapter (ver src/lib/prisma.ts).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  // PostgreSQL em dev (via Docker, `docker-compose.yml`) e em produção — paridade
+  // dev/prod (DEC-003, revisado 2026-07-05). SQLite foi descartado para evitar
+  // divergência de tipos/JSON/concorrência entre os dois ambientes.
+  provider = "postgresql"
+}
+
+/// Modelo mínimo e neutro — existe só para exercitar o fluxo de migration no P0.
+model HealthCheck {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+}
+
+// ─── Bloco 2: domínio da esteira ────────────────────────────────────────────
+
+enum DraftStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  PUBLISHED
+}
+
+/// Notícia normalizada e persistida (saída do Bloco 1, entrada do Bloco 2).
+model NewsItem {
+  id           String   @id @default(cuid())
+  title        String
+  summary      String
+  url          String
+  canonicalUrl String   @unique
+  source       String
+  publishedAt  DateTime
+  imageUrl     String?
+  collectedAt  DateTime @default(now())
+  drafts       Draft[]
+}
+
+/// Rascunho gerado pelo LLM — aguarda revisão humana (DEC-011, humano no loop).
+model Draft {
+  id         String      @id @default(cuid())
+  status     DraftStatus @default(PENDING)
+  shortTitle String
+  caption    String
+  hashtags   String      // JSON array: ["hashtag1","hashtag2"]
+  slides     String      @default("[]") // JSON array: frases dos slides do carrossel
+  newsItemId String
+  newsItem   NewsItem    @relation(fields: [newsItemId], references: [id])
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  /// Motivo do descarte (código fixo de `src/constants/rejection.ts`) — UI-10.
+  rejectionReason String?
+  /// Detalhe livre do descarte (≤ 500 chars) — UI-10.
+  rejectionNote   String?
+  /// Datas das decisões humanas (UI-12). Rascunhos antigos: null (UI usa `updatedAt`).
+  approvedAt      DateTime?
+  rejectedAt      DateTime?
+  publishedAt     DateTime?
+  /// Última edição humana do conteúdo no editor (UI-32).
+  editedAt        DateTime?
+  /// Nota do verificador de qualidade (0–100) do MELHOR resultado do AgenticRagProvider — UI-21.
+  qualityScore    Int?
+  /// JSON `{ breakdown, violations, attempts }` do verificador — UI-21.
+  qualityReport   String?
+  /// Rodada da esteira que gerou o rascunho (UI-20).
+  pipelineRunId   String?
+  pipelineRun     PipelineRun? @relation(fields: [pipelineRunId], references: [id], onDelete: SetNull)
+  /// Entradas de memória derivadas deste rascunho ao ser aprovado/rejeitado (DEC-020).
+  memoryEntries MemoryEntry[]
+}
+
+// ─── Histórico de rodadas (UI v2 — UI-20, DEC-025) ──────────────────────────
+
+enum PipelineTrigger {
+  SCHEDULED
+  MANUAL
+}
+
+/// RUNNING enquanto a rodada está em andamento; os demais são finais.
+enum PipelineRunStatus {
+  RUNNING
+  OK
+  PARTIAL
+  FAILED
+  SKIPPED
+}
+
+/// Uma rodada da esteira, com o funil por etapa (o que antes só ia para o log/Telegram).
+/// Gravada por `runOrchestratedPipeline` (fail-safe: falha de gravação não derruba a rodada).
+model PipelineRun {
+  id                    String            @id @default(cuid())
+  startedAt             DateTime          @default(now())
+  finishedAt            DateTime?
+  durationMs            Int?
+  trigger               PipelineTrigger
+  status                PipelineRunStatus @default(RUNNING)
+  collected             Int               @default(0)
+  afterDedup            Int               @default(0)
+  afterFilter           Int               @default(0)
+  afterAlreadyProcessed Int               @default(0)
+  afterSemantic         Int               @default(0)
+  selected              Int               @default(0)
+  skippedThinContent    Int               @default(0)
+  draftsCreated         Int               @default(0)
+  estimatedCostUsd      Float             @default(0)
+  /// JSON array de mensagens de erro da rodada.
+  errors                String            @default("[]")
+  /// Mensagem quando a rodada inteira falhou (status FAILED).
+  failure               String?
+  /// JSON `SourceStat[]` — saúde por fonte nesta rodada (UI-31).
+  sourceStats           String?
+  drafts                Draft[]
+
+  @@index([startedAt])
+}
+
+/// Registro de URLs canônicas já processadas — evita repetição entre rodadas (DEC-006).
+model ProcessedUrl {
+  canonicalUrl String   @id
+  processedAt  DateTime @default(now())
+}
+
+/// Trava de exclusão mútua da esteira — no máximo 1 linha (id fixo).
+/// Impede rodadas concorrentes que duplicariam rascunhos: sem ela, duas rodadas
+/// leem "não processado" ao mesmo tempo (TOCTOU em filterAlreadyProcessed) e
+/// ambas criam rascunho do mesmo item. `lockedAt` permite expirar travas órfãs
+/// de uma rodada que travou/morreu sem liberar.
+model PipelineLock {
+  id       String   @id
+  holder   String
+  lockedAt DateTime @default(now())
+}
+
+// ─── Memória de alinhamento (RAG) — DEC-017/DEC-018/DEC-020 ────────────────
+
+/// Arquétipo da entrada de memória: regra/instrução (`PROCEDURAL`) ou exemplo
+/// concreto de post (`EPISODIC`, few-shot) usado para enriquecer o prompt.
+enum MemoryKind {
+  PROCEDURAL
+  EPISODIC
+}
+
+/// Origem da entrada: curada manualmente (`config/procedural-memory.ts`) ou
+/// derivada automaticamente de uma decisão humana na UI de revisão (DEC-011).
+enum MemorySource {
+  MANUAL
+  FEEDBACK_APPROVED
+  FEEDBACK_REJECTED
+}
+
+/// Memória de alinhamento recuperada por similaridade antes de cada geração
+/// (`AgenticRagProvider`). `embedding` é `vector(768)` nativo do pgvector
+/// (DEC-021 — substitui o JSON portátil de DEC-018 agora que o projeto roda em
+/// Postgres, ver DEC-003). 768 = dimensão do `nomic-embed-text` (Ollama), o
+/// `EmbeddingProvider` default; trocar de modelo de embedding com dimensão
+/// diferente exige nova migration. `Unsupported`: Prisma Client não expõe este
+/// campo em `create`/`update`/`select` tipados — toda leitura/escrita usa SQL
+/// puro (`$queryRaw`/`$executeRaw`) em `src/services/memory/memory-store.ts`.
+model MemoryEntry {
+  id        String       @id @default(cuid())
+  kind      MemoryKind
+  source    MemorySource
+  /// Texto injetado no prompt quando esta entrada é recuperada.
+  content   String
+  /// vector(768) — ver nota acima. Só acessível via SQL puro.
+  embedding Unsupported("vector(768)")
+  /// Categoria/variante do post (ex.: "data", "business") — filtra o recall. Ausente = regra genérica.
+  category  String?
+  /// Permite "desativar" sem apagar histórico (nunca DELETE em memória de aprendizado).
+  active    Boolean      @default(true)
+  /// Rascunho de origem, quando `source` é `FEEDBACK_APPROVED`/`FEEDBACK_REJECTED`.
+  draftId   String?
+  /// SetNull: excluir um rascunho descartado mantém a lição (DEC-025 item 1).
+  draft     Draft?       @relation(fields: [draftId], references: [id], onDelete: SetNull)
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  @@index([kind, active])
+}
+
+// ─── Configurações editáveis pela UI (DEC-027) ─────────────────────────────
+
+/// Identidade, cores, palavras-chave e feeds editáveis na interface. Um único
+/// registro (id "default"); `data` é JSON validado por `settingsSchema`
+/// (src/lib/settings-schema.ts). Sem registro → vale o padrão de `config/`.
+model AppSettings {
+  id        String   @id @default("default")
+  data      String
+  updatedAt DateTime @updatedAt
+}

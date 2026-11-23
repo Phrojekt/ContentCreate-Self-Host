@@ -1,0 +1,21 @@
+# Trava de segredos: bloqueia o commit se algum arquivo staged for um .env real
+# ou trouxer algo com cara de chave de API / token / chave privada.
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+bad_files=$(printf '%s\n' "$staged" | grep -E '(^|/)\.env($|\.)' | grep -vE '(^|/)\.env\.example$' || true)
+if [ -n "$bad_files" ]; then
+  echo "✖ Commit bloqueado: arquivo de ambiente com segredos no stage:"
+  printf '  %s\n' $bad_files
+  echo "  Use .env.example para documentar variáveis (sem valores reais)."
+  exit 1
+fi
+
+secret_re='(sk-ant-[A-Za-z0-9_-]{20,}|sk-[A-Za-z0-9]{32,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|xox[abp]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+if git diff --cached -U0 --diff-filter=ACMR | grep -E '^\+' | grep -qE "$secret_re"; then
+  echo "✖ Commit bloqueado: o diff parece conter uma chave/token. Linhas suspeitas:"
+  git diff --cached -U0 --diff-filter=ACMR | grep -E '^\+' | grep -nE "$secret_re" | cut -c1-120
+  echo "  Mova o valor para o .env (que não é versionado)."
+  exit 1
+fi
+
+npx lint-staged

@@ -1,0 +1,26 @@
+services:
+  db:
+    # pgvector/pgvector:pg17 = Postgres 17 + extensão pgvector pré-instalada
+    # (postgres:17-alpine "puro" não traz a extensão). Usado por `MemoryEntry`
+    # (busca por similaridade nativa — DEC-021).
+    image: pgvector/pgvector:pg17
+    container_name: contentcreate-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: contentcreate
+      POSTGRES_PASSWORD: contentcreate
+      POSTGRES_DB: contentcreate
+    ports:
+      # 5432 tinha conflito com outro processo já ligado nesta máquina —
+      # mapeado para 5439 no host (o container continua na 5432 interna).
+      - "5439:5432"
+    volumes:
+      - contentcreate-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U contentcreate -d contentcreate"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  contentcreate-db-data:
